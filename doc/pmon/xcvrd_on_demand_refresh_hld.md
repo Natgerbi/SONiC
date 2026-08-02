@@ -25,9 +25,11 @@ Rev. 1.0
   - [2 Design](#2-design)
     - [2.1 Background](#21-background)
     - [2.2 Motivation](#22-motivation)
-    - [2.3 Flows diagram](#23-flows-diagram)
-      - [End-to-end flow](#end-to-end-flow)
-      - [Event-ordering guard](#event-ordering-guard)
+    - [2.3 Design details](#23-design-details)
+      - [2.3.1 APPL\_DB interface](#231-appl_db-interface)
+        - [Example](#example)
+      - [2.3.2 Flows diagram](#232-flows-diagram)
+      - [2.3.3 Event-ordering guard](#233-event-ordering-guard)
     - [2.4 SAI API](#24-sai-api)
     - [2.5 Platform API](#25-platform-api)
     - [2.6 Lower Layer API](#26-lower-layer-api)
@@ -43,8 +45,6 @@ Rev. 1.0
       - [2.10.4 gNMI](#2104-gnmi)
     - [2.11 DB Schema](#211-db-schema)
       - [2.11.1 Data Sample](#2111-data-sample)
-      - [Request row](#request-row)
-      - [Done row](#done-row)
     - [2.12 Memory Consumption](#212-memory-consumption)
     - [2.13 Restrictions/Limitations](#213-restrictionslimitations)
       - [Restrictions](#restrictions)
@@ -89,7 +89,6 @@ This document defines an on-demand refresh mechanism in `xcvrd` that lets SONiC 
 | Requester | Any local SONiC component that writes to the request table |
 | Representative port | The first logical port mapped to the same physical port index |
 
-
 ### 0.4 Overview
 
 `CpoDomInfoUpdateTask` collects telemetry from CPO OE's and ELS's and publishes the data under their corresponding logical ports in STATE_DB. Today, this collection runs periodically, so a component reacting to an event such as a fault indication must wait for the next polling cycle to obtain updated data.
@@ -106,7 +105,7 @@ A component that receives an asynchronous transceiver fault indication needs fre
 
 1. A local SONiC component shall be able to request an immediate refresh of selected OE and ELS STATE_DB tables for specific port.
 2. `CpoDomInfoUpdateTask` shall validate and process the request using existing `PortChangeObserver`, then report completion or failure through APPL_DB.
-3. The requester shall use the representative logical port as the request key. A non-representative logical port, or an invalid port, shall be rejected with `ERROR:INVALID_PORT`.
+3. The requester shall use the representative logical port as the request key (the port with `subport=1` when the port is split, or `subport=0`/unset when it is not). A non-representative logical port, or an invalid port, shall be rejected with `ERROR:INVALID_PORT`.
 
 ### 1.3 Configuration and Management Requirements
 
@@ -125,17 +124,88 @@ A component that receives an asynchronous transceiver fault indication needs fre
 `CpoDomInfoUpdateTask` is the `xcvrd` worker that collects diagnostics for CPO vmodules, alongside `DomInfoUpdateTask` which handles pluggable transceivers.
 On a periodic cycle it reads the sensors, status and fault flags of each OE and ELSFP, and publishes them in the OE and ELS `TRANSCEIVER_*` tables under the logical ports that use each device.
 
+In each of these STATE_DB entries (for example `TRANSCEIVER_STATUS|Ethernet0`), there is a field called `last_update_time` that records when that entry was last written. The time is in UTC, formatted `%a %b %d %H:%M:%S %Y`, for example `Mon Jul 27 14:19:04 2026`.
+
+In order to easily follow the Clear-on-Read (COR) fields, Each `*_FLAG` STATE_DB table also has three companion tables that `xcvrd` maintains whenever a flag value changes:
+
+- `*_FLAG_SET_TIME` - record the time the flag last went from `0` to `1` or `never`
+- `*_FLAG_CLEAR_TIME` - record the time it last went from `1` to `0` or `never`
+- `*_FLAG_CHANGE_COUNT` - count the number of transitions.
+
 ### 2.2 Motivation
 
-The motivation is to let a component refresh a table immediately instead of waiting for the periodic cycle to come around. For example, when a fault indication arrives, the component handling it needs the fault data right away; today it has to wait for the next poll, and until then STATE_DB still holds values collected before the event.
+This feature is mainly for Clear-on-Read (COR) fields, and its purpose is to keep `CpoDomInfoUpdateTask` their only reader. A COR field is cleared by the hardware the moment it is read, so only the first reader sees the value. If a component reads the device itself, it competes with the task for that one value: whoever reads first gets the value, and the other finds the field already cleared. Asking the task to refresh, instead of reading the device, keeps a single reader and avoids that race.
 
-The refresh is performed by `CpoDomInfoUpdateTask` rather than by the component, so `xcvrd` stays the only reader of the hardware: some fault fields are clear-on-read, and a second reader would consume flags that `xcvrd` is expected to publish.
+Another motivation is to be able to update the tables right away, instead of waiting for the periodic cycle to finish.
 
-### 2.3 Flows diagram
+### 2.3 Design details
 
-#### End-to-end flow
+#### 2.3.1 APPL_DB interface
 
-For one request:
+The feature adds two APPL_DB tables. Both are keyed by the representative logical port, so a requester writes, watches and reads on one key.
+
+**Table: `REFRESH_COUNTERS_ON_DEMAND` (APPL_DB)** — written by the requester
+
+| Field | Type | Required | Description |
+| --- | --- | --- | --- |
+| (key) | string | yes | Representative logical port owned by `CpoDomInfoUpdateTask`, e.g. `Ethernet0`. Any other port is rejected. |
+| `tables` | string | yes | Comma-separated list of STATE_DB table names to refresh. |
+| `requested_timestamp` | string | yes | UTC time of the triggering event, used by the event-ordering guard (#2.3.3) and echoed in the done row for correlation. |
+| `force` | string | no | `true` to bypass the event-ordering guard and force a hardware read. Defaults to `false`. |
+
+**Table: `REFRESH_COUNTERS_ON_DEMAND_DONE` (APPL_DB)** — written by `CpoDomInfoUpdateTask`
+
+| Field | Type | Required | Description |
+| --- | --- | --- | --- |
+| (key) | string | yes | Same logical port name used as the request key |
+| `status` | string | yes | `OK`, `PARTIAL`, or `ERROR:<reason>` (#2.8) |
+| `completed_timestamp` | string | yes | UTC time the refresh completed |
+| `requested_timestamp` | string | yes | The correlated event time from the request |
+
+`tables` may name any of the STATE_DB tables owned by `CpoDomInfoUpdateTask`:
+
+| Device | Table | Data |
+| --- | --- | --- |
+| OE | `TRANSCEIVER_DOM_SENSOR` | Module and lane sensor values |
+| OE | `TRANSCEIVER_DOM_FLAG` | Module and lane DOM flags |
+| OE | `TRANSCEIVER_STATUS` | Module and lane status |
+| OE | `TRANSCEIVER_STATUS_FLAG` | Module and lane status flags |
+| ELS | `TRANSCEIVER_ELS_DOM_SENSOR` | Module and lane sensor values |
+| ELS | `TRANSCEIVER_ELS_DOM_FLAG` | Module and lane DOM flags |
+| ELS | `TRANSCEIVER_ELS_STATUS` | Module and lane status |
+| ELS | `TRANSCEIVER_ELS_STATUS_FLAG` | Module and lane status flags |
+
+Refreshing a `*_FLAG` table also updates its `*_FLAG_CHANGE_COUNT`, `*_FLAG_SET_TIME`, and `*_FLAG_CLEAR_TIME` companion tables, which `xcvrd` writes as a side effect of the flag writer whenever a value differs from the one already in STATE_DB. 
+
+##### Example
+
+a component request refresh on `Ethernet0`
+
+```text
+APPL_DB  REFRESH_COUNTERS_ON_DEMAND:Ethernet0
+  tables              = TRANSCEIVER_DOM_FLAG,TRANSCEIVER_STATUS_FLAG,TRANSCEIVER_ELS_DOM_FLAG,TRANSCEIVER_ELS_STATUS_FLAG
+  requested_timestamp = Mon Jul 27 14:19:04 2026
+  force               = false
+```
+
+and `CpoDomInfoUpdateTask` answers on the same port:
+
+```text
+APPL_DB  REFRESH_COUNTERS_ON_DEMAND_DONE:Ethernet0
+  status              = OK
+  completed_timestamp = Mon Jul 27 14:19:05 2026
+  requested_timestamp = Mon Jul 27 14:19:04 2026
+```
+
+#### 2.3.2 Flows diagram
+
+A refresh starts at the requester and ends with the requester reading STATE_DB:
+
+1. The requester writes a request row to `REFRESH_COUNTERS_ON_DEMAND`, keyed by the representative port, naming the tables it needs and the time of the event that triggered it.
+2. `PortChangeObserver` delivers the write to `CpoDomInfoUpdateTask`, which checks that it owns the port and queues the request.
+3. The task reads the requested data from the OE or ELSFP and writes it to STATE_DB, skipping any table whose entry is already newer than the event.
+4. The task writes a done row to `REFRESH_COUNTERS_ON_DEMAND_DONE` on the same port, reporting the outcome.
+5. The requester sees the done row and reads the refreshed STATE_DB tables.
 
 ```mermaid
 sequenceDiagram
@@ -164,18 +234,15 @@ sequenceDiagram
     R->>ST: read refreshed values using the request port
 ```
 
-*Data that belongs to a shared OE or ELSFP is read once and published to every port using that device; data that belongs to a single port is read per port. Each request gets its own done row.
-
-#### Event-ordering guard
+#### 2.3.3 Event-ordering guard
 
 A refresh may arrive for a table that periodic polling has just read. Reading the device again is wasted work, and for a clear-on-read field it would consume a flag that STATE_DB already reports.
 
-So for each requested table, the task compares the request against that table's row for the requested port:
+So for each table named in `tables`, the task compares the request against the `last_update_time` field of that table's row for the requested port:
 
-- `requested_timestamp` earlier than `last_update_time`: the row already covers the event, so the read is skipped.
-- Otherwise: the device is read and the row is republished.
+- `requested_timestamp` < `last_update_time`: the row already covers the event, so the read is skipped.
+- `requested_timestamp` >=`last_update_time`: the device is read and the row is republished.
 
-Equal timestamps fall into the second case, because with one-second granularity there is no way to tell which came first.
 When `force=true` is set, the device is read anyway, regardless of the comparison.
 
 ### 2.4 SAI API
@@ -227,63 +294,22 @@ Defined reasons:
 
 ### 2.11 DB Schema
 
-This feature adds two new APPL_DB tables and reuses the OE and ELS STATE_DB tables defined by the CPO DOM design. No existing schema is changed.
+This feature adds the two APPL_DB tables described in #2.3.1, and refreshes the OE and ELS STATE_DB tables listed there. No existing schema is changed.
 
-All timestamps use the UTC format `xcvrd` already writes for `last_update_time`: `%a %b %d %H:%M:%S %Y`, for example `Mon Jul 27 14:19:04 2026`. This keeps requests directly comparable with the STATE_DB rows they refresh.
-
-**Table: `REFRESH_COUNTERS_ON_DEMAND` (APPL_DB)**
-
-| Field | Type | Required | Description |
-| --- | --- | --- | --- |
-| (key) | string | yes | Representative logical port owned by `CpoDomInfoUpdateTask`, e.g. `Ethernet0`. Any other port is rejected. |
-| `tables` | string | yes | Comma-separated list of STATE_DB table names. An unsupported name is skipped and reported as `PARTIAL`. |
-| `requested_timestamp` | string | yes | UTC time of the triggering event, used by the event-ordering guard and echoed in the done row for correlation. |
-| `force` | string | no | `true` to bypass the event-ordering guard and force a hardware read. Defaults to `false` (#2.3). |
-
-**Table: `REFRESH_COUNTERS_ON_DEMAND_DONE` (APPL_DB)**
-
-| Field | Type | Required | Description |
-| --- | --- | --- | --- |
-| (key) | string | yes | Same logical port name used as the request key |
-| `status` | string | yes | `OK`, `PARTIAL`, or `ERROR:<reason>` (#2.8) |
-| `completed_timestamp` | string | yes | UTC time the refresh completed |
-| `requested_timestamp` | string | yes | The correlated event time from the request |
-
-**Supported STATE_DB tables:**
-
-| Device | Table | Data |
-| --- | --- | --- |
-| OE | `TRANSCEIVER_DOM_SENSOR` | Module and lane sensor values |
-| OE | `TRANSCEIVER_DOM_FLAG` | Module and lane DOM flags |
-| OE | `TRANSCEIVER_STATUS` | Module and lane status |
-| OE | `TRANSCEIVER_STATUS_FLAG` | Module and lane status flags |
-| ELS | `TRANSCEIVER_ELS_DOM_SENSOR` | Module and lane sensor values |
-| ELS | `TRANSCEIVER_ELS_DOM_FLAG` | Module and lane DOM flags |
-| ELS | `TRANSCEIVER_ELS_STATUS` | Module and lane status |
-| ELS | `TRANSCEIVER_ELS_STATUS_FLAG` | Module and lane status flags |
-
-Refreshing a `*_FLAG` table also updates its existing `*_FLAG_CHANGE_COUNT`, `*_FLAG_SET_TIME`, and `*_FLAG_CLEAR_TIME` companion tables, which `xcvrd` writes as a side effect of the flag writer whenever a value differs from the one already in STATE_DB. This feature adds no new metadata table and changes none of their semantics. The ELS flag writers must therefore route their updates through the same shared writer used by the OE flag tables, otherwise the ELS tables have no transition history.
 
 #### 2.11.1 Data Sample
 
-#### Request row
+A DOM flag row and its set-time companion, after `vccHAlarm` asserted during the refresh:
 
 ```text
-APPL_DB key: REFRESH_COUNTERS_ON_DEMAND|Ethernet0
-fields:
-  tables              = TRANSCEIVER_DOM_FLAG,TRANSCEIVER_STATUS_FLAG,TRANSCEIVER_ELS_DOM_FLAG,TRANSCEIVER_ELS_STATUS_FLAG
-  requested_timestamp = Mon Jul 27 14:19:04 2026
-  force               = false
-```
+STATE_DB  TRANSCEIVER_DOM_FLAG|Ethernet0
+  tempHAlarm       = False
+  vccHAlarm        = True
+  last_update_time = Mon Jul 27 14:19:05 2026
 
-#### Done row
-
-```text
-APPL_DB key: REFRESH_COUNTERS_ON_DEMAND_DONE|Ethernet0
-fields:
-  status              = OK
-  completed_timestamp = Mon Jul 27 14:19:05 2026
-  requested_timestamp = Mon Jul 27 14:19:04 2026
+STATE_DB  TRANSCEIVER_DOM_FLAG_SET_TIME|Ethernet0
+  tempHAlarm = never
+  vccHAlarm  = Mon Jul 27 14:19:05 2026
 ```
 
 ### 2.12 Memory Consumption
