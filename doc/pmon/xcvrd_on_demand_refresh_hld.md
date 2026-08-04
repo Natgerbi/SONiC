@@ -201,27 +201,32 @@ APPL_DB  REFRESH_COUNTERS_ON_DEMAND_DONE:Ethernet0
 
 A refresh starts at the requester and ends with the requester reading STATE_DB:
 
-1. The requester writes a request row to `REFRESH_COUNTERS_ON_DEMAND`, keyed by the representative port, naming the tables it needs and the time of the event that triggered it.
-2. `PortChangeObserver` delivers the write to `CpoDomInfoUpdateTask`, which checks that it owns the port and queues the request.
+1. The requester writes a request row to `REFRESH_COUNTERS_ON_DEMAND`, keyed by the representative port, naming the tables it needs and the time of the event that triggered it, and then subscribed to `REFRESH_COUNTERS_ON_DEMAND_DONE`.
+2. `PortChangeObserver` delivers the write to `CpoDomInfoUpdateTask`, which checks that it owns the port, queues the request, and deletes the request row now that it has been consumed.
 3. The task reads the requested data from the OE or ELSFP and writes it to STATE_DB, skipping any table whose entry is already newer than the event.
 4. The task writes a done row to `REFRESH_COUNTERS_ON_DEMAND_DONE` on the same port, reporting the outcome.
-5. The requester sees the done row and reads the refreshed STATE_DB tables.
+5. The requester picks up the done row from `REFRESH_COUNTERS_ON_DEMAND_DONE` whose `requested_timestamp` matches the one it sent, and reads the refreshed STATE_DB tables.
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant R as Requester
     participant ARQ as APPL_DB(REFRESH_COUNTERS_ON_DEMAND)
-    participant OBS as PortChangeObserver
     participant DOM as CpoDomInfoUpdateTask
     participant DEV as OE / ELSFP
     participant ST as STATE_DB transceiver tables
     participant ADN as APPL_DB(REFRESH_COUNTERS_ON_DEMAND_DONE)
 
+    rect rgba(128, 128, 128, 0.12)
+        Note over ARQ,DOM: Initialization
+        DOM->>ARQ: subscribe via PortChangeObserver
+    end
+
+    Note over R,ADN: On-demand refresh
     R->>ARQ: write request row (representative port, tables, requested_timestamp, force)
-    ARQ-->>OBS: subscription event
-    OBS->>DOM: deliver refresh event
-    Note over DOM: validate task ownership and enqueue
+    R->>ADN: subscribe
+    ARQ-->>DOM: request event
+    DOM->>ARQ: delete request row after consumed
     alt last_update_time older than requested_timestamp, or force
         DOM->>DEV: read shared and banked values at their device scope
         DEV-->>DOM: requested values
@@ -230,7 +235,7 @@ sequenceDiagram
         Note over DOM: skip hardware read because STATE_DB is fresh
     end
     DOM->>ADN: write done row (status, completed_timestamp, requested_timestamp)
-    ADN-->>R: subscription/notification
+    ADN-->>R: done event, matched by requested_timestamp
     R->>ST: read refreshed values using the request port
 ```
 
@@ -321,7 +326,7 @@ APPL_DB rows remain until overwritten or deleted.
 
 #### Restrictions
 
-1. Only ports owned by `CpoDomInfoUpdateTask` and the OE/ELS tables listed in #2.11 are supported.
+1. Only ports owned by `CpoDomInfoUpdateTask` and the OE/ELS tables listed in #2.3.1 are supported.
 2. `CpoDomInfoUpdateTask` must remain the only reader of the COR fields refreshed by this feature.
 3. `requested_timestamp` must represent the triggering-event time.
 
